@@ -27,6 +27,18 @@ const overrideAnswer = async (req, res) => {
       return res.status(404).json({ success: false, message: 'Game record not found.' });
     }
 
+    // ── Authorization: room creator OR global admin ─────────────────────────
+    const requesterId = req.user._id.toString();
+    const isCreator   = game.creatorId?.toString() === requesterId;
+    const isAdmin     = req.user.role === 'admin';
+
+    if (!isCreator && !isAdmin) {
+      return res.status(403).json({
+        success: false,
+        message: 'Only the match creator or an admin can override answers.',
+      });
+    }
+
     // ── Locate the match log entry for the given question ──────────────────
     const logEntry = game.matchLog.find(
       (entry) => entry.questionId.toString() === questionId
@@ -90,7 +102,6 @@ const overrideAnswer = async (req, res) => {
     await game.save();
 
     // ── Recalculate user's lifetime stats atomically ───────────────────────
-    // Increment correct, decrement wrong — no full recount needed.
     await User.findByIdAndUpdate(userId, {
       $inc: {
         totalCorrectAnswers: 1,

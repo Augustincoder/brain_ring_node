@@ -65,6 +65,16 @@ const GameHistorySchema = new mongoose.Schema(
       enum: ['solo', '1v1', 'group'],
       required: true,
     },
+    /**
+     * The userId of the player who created the room (hostId).
+     * Used to authorize post-match override requests — only the creator
+     * OR an admin may override answers for this match.
+     */
+    creatorId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'User',
+      required: true,
+    },
     participants: [ParticipantSchema],
     matchLog: [MatchLogEntrySchema],
     /**

@@ -97,6 +97,7 @@ const finalizeMatch = async (io, room) => {
     const record = await GameHistory.create({
       matchId,
       gameType: room.gameType,
+      creatorId: room.hostId,          // room creator = override authority
       participants,
       matchLog: room.matchLog,
     });
@@ -224,7 +225,7 @@ const advanceQuestion = (io, room) => {
   room.currentQuestion = room.questions[room.currentQIndex];
   room.state = 'reading';
   room.buzzerId = null;
-  room.chancesLeft = MAX_CHANCES;
+  room.chancesLeft = Math.min(MAX_CHANCES, Math.max(1, room.players.size));
   room.currentAnswers = new Map();
   room.questionStartedAt = Date.now();
   room.buzzerOpenAt = null;
@@ -234,6 +235,8 @@ const advanceQuestion = (io, room) => {
     totalQuestions: room.questions.length,
     questionText: room.currentQuestion.questionText,
     readingTimeMs: READING_TIME_MS,
+    endTime: room.questionStartedAt + READING_TIME_MS,
+    chancesLeft: room.chancesLeft,
     players: serializePlayers(room),
   });
 
@@ -241,39 +244,28 @@ const advanceQuestion = (io, room) => {
   room.readingTimer = setTimeout(() => {
     if (room.state !== 'reading') return;
 
-    // Log this question as unanswered
-    room.matchLog.push({
-      questionId: room.currentQuestion._id,
-      playerAnswers: [],
-    });
-
-    io.to(room.roomCode).emit('question_timeout', {
-      questionIndex: room.currentQIndex,
-      correctAnswer: room.currentQuestion.correctAnswer,
-      explanation: room.currentQuestion.explanation,
-    });
-
-    setTimeout(() => advanceQuestion(io, room), 3_000);
+    setTimeout(() => openBuzzerFloor(io, room), 0);
   }, READING_TIME_MS);
 };
 
 /**
- * Opens the buzzer floor to all remaining players (used after a wrong answer).
+ * Opens the buzzer floor to all remaining players (used after reading or a wrong answer).
  */
 const openBuzzerFloor = (io, room) => {
   clearRoomTimers(room);
-  room.state = 'reading'; // re-enter reading state so players can buzz
+  room.state = 'buzzing';
   room.buzzerId = null;
   room.buzzerOpenAt = Date.now();
 
   io.to(room.roomCode).emit('buzzer_open', {
     chancesLeft: room.chancesLeft,
     answerTimeMs: ANSWER_TIME_MS,
+    endTime: room.buzzerOpenAt + ANSWER_TIME_MS,
   });
 
   // If nobody buzzes within the answer window, move on
-  room.readingTimer = setTimeout(() => {
-    if (room.state !== 'reading') return;
+  room.answerTimer = setTimeout(() => {
+    if (room.state !== 'buzzing') return;
 
     // Log remaining question as no-answer
     const existingLog = room.matchLog.find(
@@ -331,6 +323,7 @@ const registerGameHandlers = (io, socket) => {
       socket.emit('room_created', {
         roomCode,
         gameType,
+        hostId: room.hostId,
         players: serializePlayers(room),
       });
 
@@ -350,8 +343,101 @@ const registerGameHandlers = (io, socket) => {
         return socket.emit('error', { message: 'Room not found. Check your code.' });
       }
       if (room.state !== 'waiting') {
-        return socket.emit('error', { message: 'Game already in progress.' });
+        const existingPlayer = room.players.get(userId);
+        if (!existingPlayer) {
+          return socket.emit('error', { message: 'Game already in progress.' });
+        }
+        
+        // --- RECONNECTION LOGIC ---
+        existingPlayer.socketId = socket.id;
+        existingPlayer.isOffline = false;
+        socket.join(roomCode);
+        socket.roomCode = roomCode;
+        
+        // Refresh local basic state
+        socket.emit('room_created', {
+          roomCode,
+          gameType: room.gameType,
+          hostId: room.hostId,
+          players: serializePlayers(room),
+        });
+
+        // Trigger arena transition locally 
+        socket.emit('game_starting', {
+          gameType: room.gameType,
+          totalQuestions: room.questions ? room.questions.length : 0,
+          players: serializePlayers(room)
+        });
+
+        // Hydrate current active state
+        const activeStates = ['reading', 'buzzing', 'answering', 'results'];
+        if (activeStates.includes(room.state)) {
+          const q = room.currentQuestion;
+          if (q) {
+            socket.emit('question_ready', {
+              questionIndex: room.currentQIndex,
+              totalQuestions: room.questions.length,
+              questionText: q.questionText,
+              readingTimeMs: READING_TIME_MS,
+              // For reconnect: endTime is anchored to when reading STARTED, so
+              // the client computes the actual time remaining correctly.
+              endTime: (room.questionStartedAt || Date.now()) + READING_TIME_MS,
+              chancesLeft: room.chancesLeft,
+              players: serializePlayers(room),
+            });
+          }
+          
+          if (room.state === 'buzzing' || room.state === 'answering') {
+            socket.emit('buzzer_open', {
+              chancesLeft: room.chancesLeft,
+              answerTimeMs: ANSWER_TIME_MS,
+              // For reconnect: endTime anchored to when the buzzer floor OPENED.
+              endTime: (room.buzzerOpenAt || Date.now()) + ANSWER_TIME_MS,
+            });
+            if (room.state === 'answering' && room.buzzerId) {
+               socket.emit('player_answering', {
+                 buzzerId: room.buzzerId,
+                 buzzerUsername: room.players.get(room.buzzerId)?.username,
+                 answerTimeMs: ANSWER_TIME_MS,
+                 // For reconnect: anchored to when the buzzer was pressed.
+                 endTime: (room.buzzerOpenAt || Date.now()) + ANSWER_TIME_MS,
+               });
+            }
+          } else if (room.state === 'results') {
+             // Let them quickly see standard results
+             socket.emit('answer_result', {
+               userId: room.lastAnsweredId || '',
+               username: room.players.get(room.lastAnsweredId)?.username,
+               isCorrect: false,
+               correctAnswer: null,
+               chancesLeft: room.chancesLeft,
+             })
+          }
+        } else if (room.state === 'reveal') {
+            if (room.currentQuestion) {
+              socket.emit('question_reveal', {
+                questionIndex: room.currentQIndex,
+                correctAnswer: room.currentQuestion.correctAnswer,
+                explanation: room.currentQuestion.explanation,
+              });
+            }
+        } else if (room.state === 'finished') {
+           // We do not have match results cached lightly, fallback
+           socket.emit('error', { message: 'Game has already finished.' });
+        }
+
+        console.log(`[socket] ${username} reconnected to room ${roomCode} mid-game`);
+        
+        // Broadcast arrival
+        io.to(roomCode).emit('player_joined', {
+          userId,
+          username,
+          players: serializePlayers(room),
+        });
+        
+        return;
       }
+
       if (room.gameType === 'solo' && room.players.size >= 1) {
         return socket.emit('error', { message: 'Solo rooms allow only 1 player.' });
       }
@@ -371,6 +457,14 @@ const registerGameHandlers = (io, socket) => {
 
       socket.join(roomCode);
       socket.roomCode = roomCode;
+
+      // Send the room details to the joining player so local state hydrates
+      socket.emit('room_created', {
+        roomCode,
+        gameType: room.gameType,
+        hostId: room.hostId,
+        players: serializePlayers(room),
+      });
 
       // Broadcast updated player list to everyone in the room
       io.to(roomCode).emit('player_joined', {
@@ -426,13 +520,16 @@ const registerGameHandlers = (io, socket) => {
       const room = roomStore.get(socket.roomCode);
 
       if (!room) return;
-      if (room.state !== 'reading') return; // only accept during reading phase
+      if (room.state !== 'buzzing') return; // strictly only accept during active buzzer floor phase
       if (!room.players.has(userId)) return;
 
       // ── RACE CONDITION GUARD ───────────────────────────────────────────────
       // The first atomic write wins. Subsequent buzz_in events are silently
       // dropped because state transitions immediately to 'answering'.
       if (room.buzzerId !== null) return;
+      if (room.currentAnswers.has(userId)) {
+        return socket.emit('error', { message: 'Siz ushbu savolga allaqachon javob bergansiz.' });
+      }
 
       clearRoomTimers(room);
       room.buzzerId = userId;
@@ -443,6 +540,7 @@ const registerGameHandlers = (io, socket) => {
         buzzerId: userId,
         buzzerUsername: username,
         answerTimeMs: ANSWER_TIME_MS,
+        endTime: room.buzzerOpenAt + ANSWER_TIME_MS,
       });
 
       // 7-second answer timer
@@ -475,6 +573,7 @@ const registerGameHandlers = (io, socket) => {
             room.chancesLeft === 0 ? room.currentQuestion.correctAnswer : null,
           chancesLeft: room.chancesLeft,
           timedOut: true,
+          givenAnswer: '[TIMEOUT]',
         });
 
         if (room.chancesLeft <= 0) {
@@ -492,7 +591,8 @@ const registerGameHandlers = (io, socket) => {
 
           setTimeout(() => advanceQuestion(io, room), 3_000);
         } else {
-          openBuzzerFloor(io, room);
+          room.state = 'results'; // Wait state to show timeout to others
+          setTimeout(() => openBuzzerFloor(io, room), 3000);
         }
       }, ANSWER_TIME_MS);
     } catch (err) {
@@ -501,8 +601,10 @@ const registerGameHandlers = (io, socket) => {
   });
 
   // ── submit_answer ──────────────────────────────────────────────────────────
-  socket.on('submit_answer', ({ answer } = {}) => {
+  socket.on('submit_answer', (payload = {}) => {
     try {
+      // Handle both { answer: "..." } and { answerText: "..." } for compatibility
+      const answer = payload.answerText || payload.answer;
       const room = roomStore.get(socket.roomCode);
 
       if (!room) return;
@@ -580,6 +682,7 @@ const registerGameHandlers = (io, socket) => {
           correctAnswer:
             room.chancesLeft === 0 ? room.currentQuestion.correctAnswer : null,
           chancesLeft: room.chancesLeft,
+          givenAnswer: answer,
         });
 
         if (room.chancesLeft <= 0) {
@@ -597,8 +700,9 @@ const registerGameHandlers = (io, socket) => {
 
           setTimeout(() => advanceQuestion(io, room), 3_000);
         } else {
-          // Reopen buzzer floor for remaining players
-          openBuzzerFloor(io, room);
+          // Reopen buzzer floor for remaining players after 3 seconds so they can see the wrong answer
+          room.state = 'results';
+          setTimeout(() => openBuzzerFloor(io, room), 3000);
         }
       }
     } catch (err) {
@@ -615,7 +719,12 @@ const registerGameHandlers = (io, socket) => {
       const room = roomStore.get(roomCode);
       if (!room) return;
 
-      room.players.delete(userId);
+      if (room.state === 'waiting') {
+        room.players.delete(userId);
+      } else {
+        const p = room.players.get(userId);
+        if (p) p.isOffline = true;
+      }
 
       io.to(roomCode).emit('player_left', {
         userId,
@@ -625,11 +734,12 @@ const registerGameHandlers = (io, socket) => {
 
       console.log(`[socket] ${username} disconnected from room ${roomCode}`);
 
-      // If the room is now empty, clean up
-      if (room.players.size === 0) {
+      // If the room is completely empty (or everyone is offline), clean up
+      const activePlayers = Array.from(room.players.values()).filter(p => !p.isOffline);
+      if (activePlayers.length === 0) {
         clearRoomTimers(room);
         roomStore.delete(roomCode);
-        console.log(`[socket] Room ${roomCode} deleted (empty)`);
+        console.log(`[socket] Room ${roomCode} deleted (all players offline)`);
         return;
       }
 
