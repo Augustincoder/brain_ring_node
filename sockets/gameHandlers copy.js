@@ -16,12 +16,6 @@ const {
 } = require('./gameState');
 
 // ─────────────────────────────────────────────────────────────────────────────
-// CONSTANTS
-// ─────────────────────────────────────────────────────────────────────────────
-const QUESTION_TRANSITION_DELAY_MS = 3000;  // Delay between questions
-const ROOM_CLEANUP_DELAY_MS = 5000;         // Delay before deleting finished room
-
-// ─────────────────────────────────────────────────────────────────────────────
 // HELPERS
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -40,19 +34,12 @@ const normalizeAnswer = (str) =>
  * Fetch exactly TOTAL_QUESTIONS random questions.
  * For Solo mode, prefers unplayed questions but allows replaying when pool is exhausted.
  * Uses MongoDB $sample for true randomness with a single aggregation.
- * 
- * @throws {Error} If database is empty or has insufficient questions
  */
 const fetchQuestions = async (gameType, userId) => {
-  // 1. Check if the database has enough questions
+  // 1. Check if the database has any questions at all
   const totalInDb = await Question.countDocuments();
   if (totalInDb === 0) {
     throw new Error('Bazada hech qanday savol mavjud emas. Iltimos, admin bilan bog\'laning.');
-  }
-  
-  // 🔧 FIX #5: Check if we have enough questions
-  if (totalInDb < TOTAL_QUESTIONS) {
-    throw new Error(`Bazada kamida ${TOTAL_QUESTIONS} ta savol bo'lishi kerak. Hozir faqat ${totalInDb} ta mavjud.`);
   }
 
   // 2. For Solo mode, try to fetch unplayed questions first
@@ -69,12 +56,11 @@ const fetchQuestions = async (gameType, userId) => {
       
       // If we got enough unplayed questions, return them
       if (unplayedQuestions.length >= TOTAL_QUESTIONS) {
-        console.log(`[fetchQuestions] User ${userId}: ${unplayedQuestions.length} unplayed questions selected`);
         return unplayedQuestions;
       }
       
       // If pool is exhausted or insufficient, allow replaying from entire database
-      console.log(`[fetchQuestions] User ${userId} has exhausted question pool (${excluded.length}/${totalInDb} played). Allowing replay.`);
+      console.log(`[fetchQuestions] User ${userId} has exhausted question pool (${excluded.length} played). Allowing replay from entire database.`);
     }
   }
 
@@ -83,9 +69,8 @@ const fetchQuestions = async (gameType, userId) => {
     { $sample: { size: TOTAL_QUESTIONS } }
   ]);
 
-  // 🔧 FIX #5: Validate we got exactly the right number
-  if (questions.length < TOTAL_QUESTIONS) {
-    throw new Error(`Faqat ${questions.length} ta savol topildi, ${TOTAL_QUESTIONS} ta kerak edi.`);
+  if (questions.length === 0) {
+    throw new Error('Savollar topilmadi. Iltimos, bazaga savollar qo\'shing.');
   }
 
   return questions;
@@ -97,28 +82,6 @@ const fetchQuestions = async (gameType, userId) => {
 const todayStr = () => new Date().toISOString().slice(0, 10);
 
 /**
- * 🔧 FIX #7: Centralized helper to append match log entry
- * Prevents duplicate entries for the same question.
- */
-const appendMatchLog = (room, questionId, playerAnswers) => {
-  const existingIndex = room.matchLog.findIndex(
-    (entry) => entry.questionId.toString() === questionId.toString()
-  );
-  
-  if (existingIndex >= 0) {
-    // Update existing entry instead of duplicating
-    room.matchLog[existingIndex].playerAnswers = Array.from(playerAnswers.values());
-  } else {
-    // Add new entry
-    room.matchLog.push({
-      questionId,
-      playerAnswers: Array.from(playerAnswers.values()),
-    });
-  }
-};
-
-/**
- * 🔧 FIX #1 & #2: Improved finalizeMatch with better error handling
  * Finalizes the match: persists GameHistory, updates all user stats,
  * and emits match_results to the room.
  */
@@ -146,23 +109,18 @@ const finalizeMatch = async (io, room) => {
   // ── Persist to GameHistory ─────────────────────────────────────────────────
   const matchId = `${room.roomCode}-${Date.now()}`;
   let gameHistoryId = null;
-  let historyError = null;
 
   try {
     const record = await GameHistory.create({
       matchId,
       gameType: room.gameType,
-      creatorId: room.hostId,
+      creatorId: room.hostId,          // room creator = override authority
       participants,
       matchLog: room.matchLog,
     });
     gameHistoryId = record._id;
-    console.log(`[finalizeMatch] GameHistory saved: ${gameHistoryId}`);
   } catch (err) {
-    // 🔧 FIX #1: Log but don't crash - we'll still update user stats
-    console.error('[finalizeMatch] ❌ GameHistory save FAILED:', err.message);
-    historyError = err.message;
-    // Continue to update user stats even if history save failed
+    console.error('[finalizeMatch] GameHistory save failed:', err.message);
   }
 
   // ── Update each player's lifetime stats ────────────────────────────────────
@@ -176,10 +134,7 @@ const finalizeMatch = async (io, room) => {
       (async () => {
         try {
           const user = await User.findById(userId);
-          if (!user) {
-            console.error(`[finalizeMatch] User ${userId} not found, skipping stats update`);
-            return;
-          }
+          if (!user) return;
 
           // ── Stats ──────────────────────────────────────────────────────────
           user.totalGamesPlayed += 1;
@@ -227,9 +182,8 @@ const finalizeMatch = async (io, room) => {
           user.recalculateStreak();
 
           await user.save();
-          console.log(`[finalizeMatch] ✅ User stats updated: ${user.username}`);
         } catch (err) {
-          console.error(`[finalizeMatch] ❌ Failed to update user ${userId}:`, err.message);
+          console.error(`[finalizeMatch] Failed to update user ${userId}:`, err.message);
         }
       })()
     );
@@ -258,20 +212,14 @@ const finalizeMatch = async (io, room) => {
       correctAnswer: q.correctAnswer,
       explanation: q.explanation,
     })),
-    // 🔧 FIX #1: Include error info if history save failed
-    ...(historyError && { historyError }),
   };
 
   io.to(room.roomCode).emit('match_results', resultsPayload);
 
-  // 🔧 FIX #2: Reduce cleanup delay and add safety check
+  // Cleanup the room from memory after a short delay
   setTimeout(() => {
-    const currentRoom = roomStore.get(room.roomCode);
-    if (currentRoom && currentRoom.state === 'finished') {
-      roomStore.delete(room.roomCode);
-      console.log(`[finalizeMatch] Room ${room.roomCode} cleaned up`);
-    }
-  }, ROOM_CLEANUP_DELAY_MS);
+    roomStore.delete(room.roomCode);
+  }, 30_000);
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -336,8 +284,16 @@ const openBuzzerFloor = (io, room) => {
   room.answerTimer = setTimeout(() => {
     if (room.state !== 'buzzing') return;
 
-    // 🔧 FIX #7: Use centralized append function
-    appendMatchLog(room, room.currentQuestion._id, room.currentAnswers);
+    // Log remaining question as no-answer
+    const existingLog = room.matchLog.find(
+      (l) => l.questionId.toString() === room.currentQuestion._id.toString()
+    );
+    if (!existingLog) {
+      room.matchLog.push({
+        questionId: room.currentQuestion._id,
+        playerAnswers: Array.from(room.currentAnswers.values()),
+      });
+    }
 
     io.to(room.roomCode).emit('question_timeout', {
       questionIndex: room.currentQIndex,
@@ -345,7 +301,7 @@ const openBuzzerFloor = (io, room) => {
       explanation: room.currentQuestion.explanation,
     });
 
-    setTimeout(() => advanceQuestion(io, room), QUESTION_TRANSITION_DELAY_MS);
+    setTimeout(() => advanceQuestion(io, room), 3_000);
   }, ANSWER_TIME_MS);
 };
 
@@ -375,7 +331,6 @@ const registerGameHandlers = (io, socket) => {
         wrongAnswers: 0,
         totalTime: 0,
         answeredCount: 0,
-        isOffline: false, // 🔧 Explicit initialization
       });
 
       roomStore.set(roomCode, room);
@@ -404,16 +359,13 @@ const registerGameHandlers = (io, socket) => {
       if (!room) {
         return socket.emit('error', { message: 'Room not found. Check your code.' });
       }
-      
       if (room.state !== 'waiting') {
         const existingPlayer = room.players.get(userId);
         if (!existingPlayer) {
           return socket.emit('error', { message: 'Game already in progress.' });
         }
         
-        // ─────────────────────────────────────────────────────────────────────
-        // 🔧 FIX #3: IMPROVED RECONNECTION LOGIC
-        // ─────────────────────────────────────────────────────────────────────
+        // --- RECONNECTION LOGIC ---
         existingPlayer.socketId = socket.id;
         existingPlayer.isOffline = false;
         socket.join(roomCode);
@@ -434,53 +386,49 @@ const registerGameHandlers = (io, socket) => {
           players: serializePlayers(room)
         });
 
-        // Hydrate current active state with CORRECTED timestamps
+        // Hydrate current active state
         const activeStates = ['reading', 'buzzing', 'answering', 'results'];
         if (activeStates.includes(room.state)) {
           const q = room.currentQuestion;
-          if (q && room.questionStartedAt) {
-            const now = Date.now();
-            const readingElapsed = now - room.questionStartedAt;
-            const readingRemaining = Math.max(0, READING_TIME_MS - readingElapsed);
-            
+          if (q) {
             socket.emit('question_ready', {
               questionIndex: room.currentQIndex,
               totalQuestions: room.questions.length,
               questionText: q.questionText,
-              readingTimeMs: readingRemaining, // 🔧 FIX #3: Send remaining time
-              endTime: now + readingRemaining,
+              readingTimeMs: READING_TIME_MS,
+              // For reconnect: endTime is anchored to when reading STARTED, so
+              // the client computes the actual time remaining correctly.
+              endTime: (room.questionStartedAt || Date.now()) + READING_TIME_MS,
               chancesLeft: room.chancesLeft,
               players: serializePlayers(room),
             });
           }
           
           if (room.state === 'buzzing' || room.state === 'answering') {
-            const now = Date.now();
-            const buzzerElapsed = room.buzzerOpenAt ? now - room.buzzerOpenAt : 0;
-            const buzzerRemaining = Math.max(0, ANSWER_TIME_MS - buzzerElapsed);
-            
             socket.emit('buzzer_open', {
               chancesLeft: room.chancesLeft,
-              answerTimeMs: buzzerRemaining, // 🔧 FIX #3: Send remaining time
-              endTime: now + buzzerRemaining,
+              answerTimeMs: ANSWER_TIME_MS,
+              // For reconnect: endTime anchored to when the buzzer floor OPENED.
+              endTime: (room.buzzerOpenAt || Date.now()) + ANSWER_TIME_MS,
             });
-            
             if (room.state === 'answering' && room.buzzerId) {
                socket.emit('player_answering', {
                  buzzerId: room.buzzerId,
                  buzzerUsername: room.players.get(room.buzzerId)?.username,
-                 answerTimeMs: buzzerRemaining, // 🔧 FIX #3: Send remaining time
-                 endTime: now + buzzerRemaining,
+                 answerTimeMs: ANSWER_TIME_MS,
+                 // For reconnect: anchored to when the buzzer was pressed.
+                 endTime: (room.buzzerOpenAt || Date.now()) + ANSWER_TIME_MS,
                });
             }
           } else if (room.state === 'results') {
+             // Let them quickly see standard results
              socket.emit('answer_result', {
                userId: room.lastAnsweredId || '',
                username: room.players.get(room.lastAnsweredId)?.username,
                isCorrect: false,
                correctAnswer: null,
                chancesLeft: room.chancesLeft,
-             });
+             })
           }
         } else if (room.state === 'reveal') {
             if (room.currentQuestion) {
@@ -491,6 +439,7 @@ const registerGameHandlers = (io, socket) => {
               });
             }
         } else if (room.state === 'finished') {
+           // We do not have match results cached lightly, fallback
            socket.emit('error', { message: 'Game has already finished.' });
         }
 
@@ -521,12 +470,12 @@ const registerGameHandlers = (io, socket) => {
         wrongAnswers: 0,
         totalTime: 0,
         answeredCount: 0,
-        isOffline: false,
       });
 
       socket.join(roomCode);
       socket.roomCode = roomCode;
 
+      // Send the room details to the joining player so local state hydrates
       socket.emit('room_created', {
         roomCode,
         gameType: room.gameType,
@@ -534,6 +483,7 @@ const registerGameHandlers = (io, socket) => {
         players: serializePlayers(room),
       });
 
+      // Broadcast updated player list to everyone in the room
       io.to(roomCode).emit('player_joined', {
         userId,
         username,
@@ -543,8 +493,7 @@ const registerGameHandlers = (io, socket) => {
       console.log(`[socket] ${username} joined room ${roomCode}`);
     } catch (err) {
       console.error('[socket.join_room]', err);
-      // 🔧 FIX #10: Always emit error to client
-      socket.emit('error', { message: err.message || 'Failed to join room.' });
+      socket.emit('error', { message: 'Failed to join room.' });
     }
   });
 
@@ -574,10 +523,10 @@ const registerGameHandlers = (io, socket) => {
         players: serializePlayers(room),
       });
 
-      setTimeout(() => advanceQuestion(io, room), QUESTION_TRANSITION_DELAY_MS);
+      // Brief countdown before first question
+      setTimeout(() => advanceQuestion(io, room), 3_000);
     } catch (err) {
       console.error('[socket.start_game]', err);
-      // 🔧 FIX #10: Always emit error to client
       socket.emit('error', { message: err.message || 'Failed to start game.' });
     }
   });
@@ -588,12 +537,12 @@ const registerGameHandlers = (io, socket) => {
       const room = roomStore.get(socket.roomCode);
 
       if (!room) return;
-      if (room.state !== 'buzzing') return;
+      if (room.state !== 'buzzing') return; // strictly only accept during active buzzer floor phase
       if (!room.players.has(userId)) return;
 
       // ── RACE CONDITION GUARD ───────────────────────────────────────────────
-      // Note: This is still not 100% atomic but good enough for most cases
-      // True atomic operation would require Redis or similar
+      // The first atomic write wins. Subsequent buzz_in events are silently
+      // dropped because state transitions immediately to 'answering'.
       if (room.buzzerId !== null) return;
       if (room.currentAnswers.has(userId)) {
         return socket.emit('error', { message: 'Siz ushbu savolga allaqachon javob bergansiz.' });
@@ -645,8 +594,11 @@ const registerGameHandlers = (io, socket) => {
         });
 
         if (room.chancesLeft <= 0) {
-          // 🔧 FIX #7: Use centralized append
-          appendMatchLog(room, room.currentQuestion._id, room.currentAnswers);
+          // Finalize log entry, reveal answer, move on
+          room.matchLog.push({
+            questionId: room.currentQuestion._id,
+            playerAnswers: Array.from(room.currentAnswers.values()),
+          });
 
           io.to(room.roomCode).emit('question_reveal', {
             questionIndex: room.currentQIndex,
@@ -654,22 +606,21 @@ const registerGameHandlers = (io, socket) => {
             explanation: room.currentQuestion.explanation,
           });
 
-          setTimeout(() => advanceQuestion(io, room), QUESTION_TRANSITION_DELAY_MS);
+          setTimeout(() => advanceQuestion(io, room), 3_000);
         } else {
-          room.state = 'results';
-          setTimeout(() => openBuzzerFloor(io, room), QUESTION_TRANSITION_DELAY_MS);
+          room.state = 'results'; // Wait state to show timeout to others
+          setTimeout(() => openBuzzerFloor(io, room), 3000);
         }
       }, ANSWER_TIME_MS);
     } catch (err) {
       console.error('[socket.buzz_in]', err);
-      // 🔧 FIX #10: Emit error
-      socket.emit('error', { message: 'Buzzer error occurred.' });
     }
   });
 
   // ── reset_played_questions ──────────────────────────────────────────────────
   socket.on('reset_played_questions', async () => {
     try {
+      const User = require('../models/User'); // Ensure User model is available
       await User.findByIdAndUpdate(userId, { $set: { playedQuestions: [] } });
       socket.emit('reset_played_questions_success');
       console.log(`[socket] ${username} reset their played questions history.`);
@@ -682,6 +633,7 @@ const registerGameHandlers = (io, socket) => {
   // ── submit_answer ──────────────────────────────────────────────────────────
   socket.on('submit_answer', (payload = {}) => {
     try {
+      // Handle both { answer: "..." } and { answerText: "..." } for compatibility
       const answer = payload.answerText || payload.answer;
       const room = roomStore.get(socket.roomCode);
 
@@ -727,8 +679,11 @@ const registerGameHandlers = (io, socket) => {
       room.state = 'reveal';
 
       if (isCorrect) {
-        // 🔧 FIX #7: Use centralized append
-        appendMatchLog(room, room.currentQuestion._id, room.currentAnswers);
+        // Correct → save log entry, broadcast, advance
+        room.matchLog.push({
+          questionId: room.currentQuestion._id,
+          playerAnswers: Array.from(room.currentAnswers.values()),
+        });
 
         io.to(room.roomCode).emit('answer_result', {
           userId,
@@ -745,8 +700,9 @@ const registerGameHandlers = (io, socket) => {
           explanation: room.currentQuestion.explanation,
         });
 
-        setTimeout(() => advanceQuestion(io, room), QUESTION_TRANSITION_DELAY_MS);
+        setTimeout(() => advanceQuestion(io, room), 3_000);
       } else {
+        // Wrong answer
         room.chancesLeft -= 1;
 
         io.to(room.roomCode).emit('answer_result', {
@@ -760,8 +716,11 @@ const registerGameHandlers = (io, socket) => {
         });
 
         if (room.chancesLeft <= 0) {
-          // 🔧 FIX #7: Use centralized append
-          appendMatchLog(room, room.currentQuestion._id, room.currentAnswers);
+          // All chances exhausted
+          room.matchLog.push({
+            questionId: room.currentQuestion._id,
+            playerAnswers: Array.from(room.currentAnswers.values()),
+          });
 
           io.to(room.roomCode).emit('question_reveal', {
             questionIndex: room.currentQIndex,
@@ -769,16 +728,15 @@ const registerGameHandlers = (io, socket) => {
             explanation: room.currentQuestion.explanation,
           });
 
-          setTimeout(() => advanceQuestion(io, room), QUESTION_TRANSITION_DELAY_MS);
+          setTimeout(() => advanceQuestion(io, room), 3_000);
         } else {
+          // Reopen buzzer floor for remaining players after 3 seconds so they can see the wrong answer
           room.state = 'results';
-          setTimeout(() => openBuzzerFloor(io, room), QUESTION_TRANSITION_DELAY_MS);
+          setTimeout(() => openBuzzerFloor(io, room), 3000);
         }
       }
     } catch (err) {
       console.error('[socket.submit_answer]', err);
-      // 🔧 FIX #10: Emit error
-      socket.emit('error', { message: 'Answer submission error.' });
     }
   });
 
@@ -791,21 +749,16 @@ const registerGameHandlers = (io, socket) => {
       const room = roomStore.get(roomCode);
       if (!room) return;
 
-      console.log(`[socket] ${username} force quit game in room ${roomCode}`);
+      console.log(`[socket] ${username} requested early match finalization for room ${roomCode}`);
 
-      // 🔧 FIX #8: Notify other players before finalizing
-      io.to(roomCode).emit('game_force_quit', {
-        message: 'O\'yin yakunlandi (foydalanuvchi chiqdi)',
-        quittedBy: username,
-      });
-
+      // Finalize the match immediately to save results gathered so far
       await finalizeMatch(io, room);
 
+      // Cleanup room immediately
       clearRoomTimers(room);
       roomStore.delete(roomCode);
     } catch (err) {
       console.error('[socket.force_quit_game]', err);
-      socket.emit('error', { message: 'Failed to quit game.' });
     }
   });
 
@@ -842,35 +795,34 @@ const registerGameHandlers = (io, socket) => {
         return;
       }
 
-      // 🔧 FIX #6: If disconnected player held the buzzer, clear timers before reopening
+      // If the disconnected player held the buzzer, open the floor
       if (room.buzzerId === userId && room.state === 'answering') {
-        clearRoomTimers(room); // 🔧 FIX #6: Clear timers!
-        
         room.chancesLeft -= 1;
         room.buzzerId = null;
 
         if (room.chancesLeft <= 0) {
-          // 🔧 FIX #7: Use centralized append
-          appendMatchLog(room, room.currentQuestion._id, room.currentAnswers);
-          
+          clearRoomTimers(room);
+          room.matchLog.push({
+            questionId: room.currentQuestion._id,
+            playerAnswers: Array.from(room.currentAnswers.values()),
+          });
           io.to(roomCode).emit('question_reveal', {
             questionIndex: room.currentQIndex,
             correctAnswer: room.currentQuestion.correctAnswer,
             explanation: room.currentQuestion.explanation,
           });
-          setTimeout(() => advanceQuestion(io, room), QUESTION_TRANSITION_DELAY_MS);
+          setTimeout(() => advanceQuestion(io, room), 3_000);
         } else {
           openBuzzerFloor(io, room);
         }
       }
 
-      // 🔧 FIX #9: Reassign host regardless of state
-      if (room.hostId === userId) {
+      // Reassign host if needed
+      if (room.hostId === userId && room.state === 'waiting') {
         const nextHost = room.players.keys().next().value;
         if (nextHost) {
           room.hostId = nextHost;
           io.to(roomCode).emit('host_changed', { newHostId: nextHost });
-          console.log(`[socket] Host reassigned from ${username} to ${room.players.get(nextHost)?.username}`);
         }
       }
     } catch (err) {
