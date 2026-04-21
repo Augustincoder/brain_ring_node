@@ -2,6 +2,7 @@
 
 const GameHistory = require('../models/GameHistory');
 const User = require('../models/User');
+const { roomStore } = require('../sockets/gameState');
 
 /**
  * POST /api/game/override
@@ -150,4 +151,49 @@ const getMyGameHistory = async (req, res) => {
   }
 };
 
-module.exports = { overrideAnswer, getMyGameHistory };
+/**
+ * GET /api/game/room/check/:code
+ * Checks if a room exists and is in the 'waiting' state.
+ */
+const checkRoomStatus = async (req, res) => {
+  try {
+    const code = String(req.params.code || '').trim();
+    
+    if (!/^\d{4}$/.test(code)) {
+      return res.status(200).json({
+        exists: false,
+        message: 'Kodni 4 ta raqam ko\'rinishida kiriting.',
+      });
+    }
+
+    console.log(`[gameController] Room check for: "${code}" | Active: [${Array.from(roomStore.keys()).join(', ')}]`);
+
+    const room = roomStore.get(code);
+
+    if (!room) {
+      return res.status(200).json({
+        exists: false,
+        message: 'Xona topilmadi. Kodni tekshirib ko\'ring yoki yangi xona oching.',
+      });
+    }
+
+    if (room.state === 'finished') {
+      return res.status(200).json({
+        exists: false,
+        message: 'Ushbu o\'yin allaqachon tugagan.',
+      });
+    }
+
+    return res.status(200).json({
+      exists: true,
+      gameType: room.gameType,
+      playerCount: room.players.size,
+      state: room.state,
+    });
+  } catch (error) {
+    console.error('[gameController.checkRoomStatus]', error);
+    res.status(200).json({ exists: false, message: 'Serverda xatolik yuz berdi.' });
+  }
+};
+
+module.exports = { overrideAnswer, getMyGameHistory, checkRoomStatus };

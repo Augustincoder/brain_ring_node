@@ -710,6 +710,28 @@ const registerGameHandlers = (io, socket) => {
     }
   });
 
+  // ── force_quit_game ────────────────────────────────────────────────────────
+  socket.on('force_quit_game', async () => {
+    try {
+      const roomCode = socket.roomCode;
+      if (!roomCode) return;
+
+      const room = roomStore.get(roomCode);
+      if (!room) return;
+
+      console.log(`[socket] ${username} requested early match finalization for room ${roomCode}`);
+
+      // Finalize the match immediately to save results gathered so far
+      await finalizeMatch(io, room);
+
+      // Cleanup room immediately
+      clearRoomTimers(room);
+      roomStore.delete(roomCode);
+    } catch (err) {
+      console.error('[socket.force_quit_game]', err);
+    }
+  });
+
   // ── disconnect ─────────────────────────────────────────────────────────────
   socket.on('disconnect', () => {
     try {
