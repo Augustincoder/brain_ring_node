@@ -11,6 +11,8 @@ const {
   deleteUser,
   bulkCreateQuestions,
   getAllQuestions,
+  createQuestion,
+  updateQuestion,
   deleteQuestion,
   getGameHistory,
 } = require('../controllers/adminController');
@@ -27,7 +29,10 @@ router.delete('/users/:id', deleteUser);
 
 // ── Question Management ──────────────────────────────────────────────────────
 router.get('/questions', getAllQuestions);
+router.post('/questions', createQuestion);
 router.post('/questions/bulk', bulkCreateQuestions);
+router.patch('/questions/:id', updateQuestion);
+router.put('/questions/:id', updateQuestion);
 router.delete('/questions/:id', deleteQuestion);
 
 // ── Analytics ────────────────────────────────────────────────────────────────

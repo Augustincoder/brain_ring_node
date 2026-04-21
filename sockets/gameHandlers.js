@@ -37,10 +37,18 @@ const normalizeAnswer = (str) =>
  */
 const fetchQuestions = async (gameType, userId) => {
   const pipeline = [];
+  
+  // 1. Check if the database has any questions at all
+  const totalInDb = await Question.countDocuments();
+  if (totalInDb === 0) {
+    throw new Error('DB_EMPTY');
+  }
 
+  // 2. For Solo mode, filter out already-played questions
   if (gameType === 'solo' && userId) {
     const user = await User.findById(userId).select('playedQuestions').lean();
     const excluded = user?.playedQuestions ?? [];
+    
     if (excluded.length > 0) {
       pipeline.push({ $match: { _id: { $nin: excluded } } });
     }
@@ -50,10 +58,13 @@ const fetchQuestions = async (gameType, userId) => {
 
   const questions = await Question.aggregate(pipeline);
 
-  if (questions.length < TOTAL_QUESTIONS) {
-    throw new Error(
-      `Not enough unique questions. Found ${questions.length}, need ${TOTAL_QUESTIONS}.`
-    );
+  // 3. If aggregate returns 0 but totalInDb was > 0, the specific user is exhausted
+  if (questions.length === 0) {
+    if (gameType === 'solo') {
+      throw new Error('POOL_EXHAUSTED');
+    }
+    // For non-solo, this shouldn't really happen if totalInDb > 0, but safety first
+    throw new Error('Savollar topilmadi. Iltimos, bazaga savollar qo\'shing.');
   }
 
   return questions;
@@ -597,6 +608,19 @@ const registerGameHandlers = (io, socket) => {
       }, ANSWER_TIME_MS);
     } catch (err) {
       console.error('[socket.buzz_in]', err);
+    }
+  });
+
+  // ── reset_played_questions ──────────────────────────────────────────────────
+  socket.on('reset_played_questions', async () => {
+    try {
+      const User = require('../models/User'); // Ensure User model is available
+      await User.findByIdAndUpdate(userId, { $set: { playedQuestions: [] } });
+      socket.emit('reset_played_questions_success');
+      console.log(`[socket] ${username} reset their played questions history.`);
+    } catch (err) {
+      console.error('[socket.reset_played_questions]', err);
+      socket.emit('error', { message: 'Failed to reset history.' });
     }
   });
 

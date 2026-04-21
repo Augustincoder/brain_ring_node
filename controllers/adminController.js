@@ -234,6 +234,68 @@ const getAllQuestions = async (req, res) => {
 };
 
 /**
+ * POST /api/admin/questions
+ * Creates a single question in the bank.
+ */
+const createQuestion = async (req, res) => {
+  try {
+    const { questionText, correctAnswer, difficulty, category, explanation } = req.body;
+
+    if (!questionText || !correctAnswer) {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'Question text and correct answer are required.' 
+      });
+    }
+
+    const question = await Question.create({
+      questionText,
+      correctAnswer,
+      difficulty: difficulty || 'medium',
+      category: category || 'General',
+      explanation: explanation || '',
+    });
+
+    res.status(201).json({ success: true, data: question });
+  } catch (error) {
+    console.error('[adminController.createQuestion]', error);
+    res.status(500).json({ success: false, message: 'Failed to create question.' });
+  }
+};
+
+/**
+ * PATCH /api/admin/questions/:id
+ * Updates a single question's fields.
+ */
+const updateQuestion = async (req, res) => {
+  try {
+    const { questionText, correctAnswer, difficulty, category, explanation } = req.body;
+    
+    const updateFields = {};
+    if (questionText !== undefined) updateFields.questionText = questionText;
+    if (correctAnswer !== undefined) updateFields.correctAnswer = correctAnswer;
+    if (difficulty !== undefined) updateFields.difficulty = difficulty;
+    if (category !== undefined) updateFields.category = category;
+    if (explanation !== undefined) updateFields.explanation = explanation;
+
+    const question = await Question.findByIdAndUpdate(
+      req.params.id,
+      { $set: updateFields },
+      { new: true, runValidators: true }
+    );
+
+    if (!question) {
+      return res.status(404).json({ success: false, message: 'Question not found.' });
+    }
+
+    res.status(200).json({ success: true, data: question });
+  } catch (error) {
+    console.error('[adminController.updateQuestion]', error);
+    res.status(500).json({ success: false, message: 'Failed to update question.' });
+  }
+};
+
+/**
  * DELETE /api/admin/questions/:id
  * Removes a single question from the bank.
  */
@@ -298,6 +360,8 @@ module.exports = {
   deleteUser,
   bulkCreateQuestions,
   getAllQuestions,
+  createQuestion,
+  updateQuestion,
   deleteQuestion,
   getGameHistory,
 };
